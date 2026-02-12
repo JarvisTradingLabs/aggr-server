@@ -355,15 +355,481 @@ The design above focuses on TimescaleDB (`upsertBars`, `resampleRangeToTimeframe
 - InfluxDB's `INSERT` is naturally idempotent (same timestamp + tags = overwrite), so `ON CONFLICT` semantics are implicit.
 - The exclusion zone logic remains the same.
 
-## 5. File Structure
+## 5. Storage Layer Changes
 
+Backfill requires new interfaces on both storage backends (gap detection queries, isolated write access) and a new method on the Exchange base class (fetching trades without emitting into the real-time pipeline).
+
+### 5.1 Current Storage Interfaces (Before)
+
+**TimescaleDB (`src/storage/timescaledb.js`) — existing public methods:**
+
+| Method | Signature | Used by |
+|--------|-----------|---------|
+| `connect()` | `() → Promise<void>` | server init |
+| `save()` | `(trades: Trade[], isExiting: boolean) → Promise<void>` | real-time pipeline (`backupTrades`) |
+| `processTrades()` | `(trades: Trade[]) → Promise<void>` | `save()` internal — mutates `this.pendingBars` |
+| `flush()` | `(isExiting: boolean) → Promise<void>` | `save()` internal — writes `pendingBars` to DB |
+| `upsertBars()` | `(timeframe: number, market: string, bars: Bar[]) → Promise<{fromTsWritten, toTsWritten}>` | `flush()` internal |
+| `resampleToHigherTimeframes()` | `(market: string, fromTs: number, toTs: number) → Promise<void>` | `flush()` internal |
+| `resampleRangeToTimeframe()` | `(market: string, fromTs: number, toTs: number, targetTimeframe: number) → Promise<void>` | `resampleToHigherTimeframes()` internal |
+| `fetch()` | `({from, to, timeframe, markets}) → Promise<output>` | HTTP API (`/historical`) |
+| `getPendingBars()` | `(markets: string[], from: number, to: number) → Bar[]` | `fetch()` internal |
+| `getPersistedBar()` | `(market: string, timestamp: number) → Promise<Bar\|null>` | `processTrades()` internal |
+
+**InfluxDB (`src/storage/influx.js`) — existing public methods:**
+
+| Method | Signature | Used by |
+|--------|-----------|---------|
+| `connect()` | `() → Promise<void>` | server init |
+| `save()` | `(trades: Trade[], isExiting: boolean) → Promise<void>` | real-time pipeline (`backupTrades`) |
+| `processTrades()` | `(trades: Trade[]) → Promise<void>` | `save()` internal — mutates `this.pendingBars` |
+| `import()` | `() → Promise<void>` | `save()` internal — `importPendingBars` + `resample` |
+| `importPendingBars()` | `() → Promise<{from, to, markets}>` | `import()` internal |
+| `writePoints()` | `(points: IPoint[], options: IWriteOptions) → Promise<void>` | `importPendingBars()` internal |
+| `resample()` | `(range: TimeRange, fromTimeframe?, toTimeframe?) → Promise<void>` | `import()` internal |
+| `executeQuery()` | `(query: string) → Promise<void>` | `resample()` internal |
+| `fetch()` | `({from, to, timeframe, markets}) → Promise<output>` | HTTP API (`/historical`) |
+| `getPendingBars()` | `(markets: string[], from: number, to: number) → Bar[]` | `fetch()` internal |
+
+**Exchange (`src/exchange.js`) — relevant existing methods:**
+
+| Method | Signature | Used by |
+|--------|-----------|---------|
+| `getMissingTrades()` | `(range: {pair, from, to}) → Promise<number>` | real-time recovery — **emits trades via `this.emitTrades()`** |
+| `emitTrades()` | `(apiId, trades: Trade[]) → void` | injects into `server.chunk[]` via event |
+| `recoverSinceLastTrade()` | `(connection: Connection) → void` | reconnection handler |
+| `registerRangeForRecovery()` | `(range) → void` | recovery queue |
+
+### 5.2 New Interfaces Required
+
+#### 5.2.1 TimescaleDB — New Methods
+
+**`getExistingBuckets(market, timeframe, from, to)`** — Gap detection query
+
+```js
+/**
+ * Returns the set of existing bucket timestamps for a given market + timeframe within [from, to).
+ * Used by GapDetector to identify missing bars.
+ *
+ * @param {string} market - e.g. "BINANCE:btcusdt"
+ * @param {number} timeframe - timeframe in ms, e.g. 60000
+ * @param {number} from - start timestamp in ms (inclusive)
+ * @param {number} to - end timestamp in ms (exclusive)
+ * @returns {Promise<number[]>} - sorted array of existing bucket timestamps (ms)
+ */
+async getExistingBuckets(market, timeframe, from, to) {
+  const query = `
+    SELECT EXTRACT(EPOCH FROM bucket)::bigint * 1000 AS ts
+    FROM ${this.tablePath}
+    WHERE timeframe_ms = $1
+      AND market = $2
+      AND bucket >= to_timestamp($3 / 1000.0)
+      AND bucket < to_timestamp($4 / 1000.0)
+    ORDER BY bucket ASC
+  `
+  const result = await this.backfillPool.query(query, [timeframe, market, from, to])
+  return result.rows.map(row => Number(row.ts))
+}
 ```
-src/
-  services/
-    backfill.js            # BackfillService class (main orchestrator)
-    backfill-detector.js   # GapDetector class (completeness check logic)
-    backfill-filler.js     # GapFiller class (fetch + aggregate + write)
+
+**`getBarCount(market, timeframe, from, to)`** — Quick existence check before fetching trades
+
+```js
+/**
+ * Returns count of existing base-timeframe bars within a range.
+ * Used by GapFiller to decide whether base data needs fetching.
+ *
+ * @param {string} market
+ * @param {number} timeframe - base timeframe in ms
+ * @param {number} from - start timestamp in ms (inclusive)
+ * @param {number} to - end timestamp in ms (exclusive)
+ * @returns {Promise<number>}
+ */
+async getBarCount(market, timeframe, from, to) {
+  const query = `
+    SELECT COUNT(*) AS cnt
+    FROM ${this.tablePath}
+    WHERE timeframe_ms = $1
+      AND market = $2
+      AND bucket >= to_timestamp($3 / 1000.0)
+      AND bucket < to_timestamp($4 / 1000.0)
+  `
+  const result = await this.backfillPool.query(query, [timeframe, market, from, to])
+  return Number(result.rows[0].cnt)
+}
 ```
+
+**`createBackfillPool()`** — Isolated connection pool
+
+```js
+/**
+ * Creates a separate PG connection pool for backfill operations.
+ * Prevents backfill DB queries from starving real-time writes.
+ *
+ * @returns {Pool} - pg Pool instance with limited max connections
+ */
+createBackfillPool() {
+  this.backfillPool = new Pool({
+    ...this.poolConfig,      // same host/port/database/credentials
+    max: 2,                  // limited: only 2 connections for backfill
+    application_name: 'aggr-server-backfill'
+  })
+  return this.backfillPool
+}
+```
+
+**`backfillUpsertBars(timeframe, market, bars)`** — Write bars using backfill pool
+
+```js
+/**
+ * Same logic as upsertBars() but uses the backfill connection pool.
+ * Prevents backfill writes from competing with real-time writes on the main pool.
+ *
+ * @param {number} timeframe
+ * @param {string} market
+ * @param {Bar[]} bars
+ * @returns {Promise<{fromTsWritten: number|null, toTsWritten: number|null}>}
+ */
+async backfillUpsertBars(timeframe, market, bars) {
+  // identical SQL to upsertBars(), but uses this.backfillPool instead of this.pool
+}
+```
+
+**`backfillResampleRange(market, fromTs, toTs)`** — Resample using backfill pool
+
+```js
+/**
+ * Same logic as resampleToHigherTimeframes() but uses the backfill connection pool.
+ *
+ * @param {string} market
+ * @param {number} fromTs
+ * @param {number} toTs
+ * @returns {Promise<void>}
+ */
+async backfillResampleRange(market, fromTs, toTs) {
+  // identical logic to resampleToHigherTimeframes(), but uses this.backfillPool
+}
+```
+
+**Refactoring note:** To avoid duplicating SQL logic between `upsertBars` / `backfillUpsertBars` and `resampleRangeToTimeframe` / `backfillResampleRange`, extract the SQL-building logic into internal helpers that accept a `pool` parameter:
+
+```js
+// Internal: shared SQL logic, pool is injected
+async _upsertBarsWithPool(pool, timeframe, market, bars) { ... }
+async _resampleRangeWithPool(pool, market, fromTs, toTs, targetTimeframe) { ... }
+
+// Public: real-time path (uses this.pool)
+async upsertBars(timeframe, market, bars) {
+  return this._upsertBarsWithPool(this.pool, timeframe, market, bars)
+}
+
+// Public: backfill path (uses this.backfillPool)
+async backfillUpsertBars(timeframe, market, bars) {
+  return this._upsertBarsWithPool(this.backfillPool, timeframe, market, bars)
+}
+```
+
+#### 5.2.2 InfluxDB — New Methods
+
+**`getExistingBuckets(market, timeframe, from, to)`** — Gap detection query
+
+```js
+/**
+ * Returns the set of existing bucket timestamps for gap detection.
+ *
+ * @param {string} market
+ * @param {number} timeframe - in ms
+ * @param {number} from - ms timestamp (inclusive)
+ * @param {number} to - ms timestamp (exclusive)
+ * @returns {Promise<number[]>} - sorted array of existing bucket timestamps (ms)
+ */
+async getExistingBuckets(market, timeframe, from, to) {
+  const timeframeLitteral = getHms(timeframe)
+  const rpName = config.influxRetentionPrefix + timeframeLitteral
+  const measurement = config.influxMeasurement + '_' + timeframeLitteral
+
+  const query = `SELECT time FROM "${config.influxDatabase}"."${rpName}"."${measurement}"
+    WHERE market = '${market}'
+      AND time >= ${from}ms AND time < ${to}ms
+    ORDER BY time ASC`
+
+  const result = await this.influx.query(query, { precision: 'ms', epoch: 'ms' })
+  return result.map(row => +row.time)
+}
+```
+
+**`backfillWritePoints(points)`** — Write bars directly (bypasses pendingBars)
+
+```js
+/**
+ * Write bar points directly to InfluxDB for backfill.
+ * Bypasses the pendingBars buffer entirely.
+ * Uses the same retention policy and measurement naming as real-time writes.
+ *
+ * @param {Bar[]} bars - aggregated bars at base timeframe
+ * @returns {Promise<void>}
+ */
+async backfillWritePoints(bars) {
+  const points = bars.map(bar => ({
+    measurement: 'trades_' + getHms(config.influxTimeframe),
+    tags: { market: bar.market },
+    fields: {
+      open: bar.open, high: bar.high, low: bar.low, close: bar.close,
+      vbuy: bar.vbuy, vsell: bar.vsell, cbuy: bar.cbuy, csell: bar.csell,
+      lbuy: bar.lbuy, lsell: bar.lsell
+    },
+    timestamp: +bar.time
+  }))
+
+  await this.writePoints(points, { precision: 'ms', retentionPolicy: this.baseRp })
+}
+```
+
+**`backfillResample(market, from, to)`** — Resample a specific range for backfill
+
+```js
+/**
+ * Trigger resample for a specific market and time range (backfill use).
+ * Wraps the existing resample() method with a targeted range.
+ *
+ * @param {string} market
+ * @param {number} from - ms timestamp
+ * @param {number} to - ms timestamp
+ * @returns {Promise<void>}
+ */
+async backfillResample(market, from, to) {
+  await this.resample({ from, to, markets: [market] })
+}
+```
+
+**Note:** InfluxDB is HTTP-based and doesn't have a connection pool in the same sense as PostgreSQL. There is no need for a separate pool — concurrent writes are naturally handled by HTTP. The existing `writePoints()` with retry logic is sufficient.
+
+#### 5.2.3 Exchange — New Method
+
+**Problem:** The current `getMissingTrades()` calls `this.emitTrades(null, trades)` internally, which injects recovered trades into `server.chunk[]` via the event system. This is correct for real-time recovery but wrong for backfill — backfill must NOT pollute the real-time pipeline.
+
+**`fetchHistoricalTrades(range)`** — Fetch trades without emitting
+
+```js
+/**
+ * Fetch historical trades from exchange REST API for a given time range.
+ * Unlike getMissingTrades(), does NOT call this.emitTrades() — returns trades directly.
+ * Used exclusively by the backfill service.
+ *
+ * @param {{pair: string, from: number, to: number}} range
+ * @returns {Promise<Trade[]>} - array of trade objects
+ */
+async fetchHistoricalTrades(range) { ... }
+```
+
+**Implementation strategy — per exchange:**
+
+Taking Binance as example (`src/exchanges/binance.js`):
+
+```js
+// BEFORE (existing):
+getMissingTrades(range, totalRecovered = 0) {
+  const endpoint = `...aggTrades?symbol=${range.pair.toUpperCase()}&startTime=${range.from + 1}&endTime=${...}`
+  return axios.get(endpoint).then(response => {
+    if (response.data.length) {
+      const trades = response.data.map(trade => ({
+        ...this.formatTrade(trade, range.pair),
+        count: trade.l - trade.f + 1,
+        timestamp: trade.T
+      }))
+      this.emitTrades(null, trades)  // <── injects into real-time pipeline
+      totalRecovered += trades.length
+      range.from = trades[trades.length - 1].timestamp
+      if (range.to - range.from > 1000) {
+        return this.waitBeforeContinueRecovery().then(() =>
+          this.getMissingTrades(range, totalRecovered)
+        )
+      }
+    }
+    return totalRecovered
+  })
+}
+
+// AFTER (new method added):
+async fetchHistoricalTrades(range, allTrades = []) {
+  const startTime = range.from
+  const endTime = Math.min(range.to, startTime + 1000 * 60 * 60) // 1h chunks
+
+  const endpoint = `...aggTrades?symbol=${range.pair.toUpperCase()}&startTime=${startTime + 1}&endTime=${endTime}&limit=1000`
+  const response = await axios.get(endpoint)
+
+  if (response.data.length) {
+    const trades = response.data.map(trade => ({
+      ...this.formatTrade(trade, range.pair),
+      count: trade.l - trade.f + 1,
+      timestamp: trade.T
+    }))
+    allTrades.push(...trades)
+    range.from = trades[trades.length - 1].timestamp
+
+    if (range.to - range.from > 1000) {
+      await sleep(config.backfillRequestDelay)
+      return this.fetchHistoricalTrades(range, allTrades)
+    }
+  }
+
+  return allTrades   // <── returns directly, NO emitTrades()
+}
+```
+
+Each exchange that currently implements `getMissingTrades()` needs a corresponding `fetchHistoricalTrades()`:
+
+| Exchange | Has `getMissingTrades` | Needs `fetchHistoricalTrades` |
+|----------|----------------------|-------------------------------|
+| BINANCE | yes | yes |
+| BINANCE_FUTURES | yes | yes |
+| BYBIT | yes | yes |
+| COINBASE | yes | yes |
+| BITFINEX | yes | yes |
+| BITMEX | yes | yes |
+| OKEX | yes | yes |
+| KRAKEN | yes | yes |
+| HUOBI | yes | yes |
+| CRYPTOCOM | yes | yes |
+| BITMART | yes | yes |
+| Others | no | no (skipped by backfill) |
+
+**Refactoring note:** To avoid code duplication, extract shared REST fetch logic:
+
+```js
+// Exchange base class (src/exchange.js):
+
+/**
+ * Internal: fetch trades from REST API for a range (no emit).
+ * Subclasses implement _fetchTradesPage(range) to do one page of REST API call.
+ *
+ * @param {{pair: string, from: number, to: number}} range
+ * @returns {Promise<Trade[]>}
+ */
+async fetchHistoricalTrades(range) {
+  if (typeof this._fetchTradesPage !== 'function') {
+    throw new Error(`${this.id} does not support fetchHistoricalTrades`)
+  }
+
+  const allTrades = []
+
+  while (range.to - range.from > 1000) {
+    const trades = await this._fetchTradesPage(range)
+
+    if (!trades || !trades.length) break
+
+    allTrades.push(...trades)
+    range.from = trades[trades.length - 1].timestamp
+
+    if (range.to - range.from > 1000) {
+      await sleep(config.backfillRequestDelay || 500)
+    }
+  }
+
+  return allTrades
+}
+```
+
+Then each exchange just implements `_fetchTradesPage(range)` returning `Trade[]`:
+
+```js
+// src/exchanges/binance.js:
+async _fetchTradesPage(range) {
+  const endTime = Math.min(range.to, range.from + 3600000)
+  const endpoint = `...aggTrades?symbol=${range.pair.toUpperCase()}&startTime=${range.from + 1}&endTime=${endTime}&limit=1000`
+  const response = await axios.get(endpoint)
+  return response.data.map(trade => ({
+    ...this.formatTrade(trade, range.pair),
+    count: trade.l - trade.f + 1,
+    timestamp: trade.T
+  }))
+}
+```
+
+#### 5.2.4 BackfillService — Unified Storage Adapter Interface
+
+BackfillService should not need to know whether the underlying storage is TimescaleDB or InfluxDB. Define a common interface that both storage classes satisfy:
+
+```js
+/**
+ * @interface BackfillStorageAdapter
+ *
+ * The subset of storage methods that BackfillService depends on.
+ * Both TimescaleDbStorage and InfluxStorage implement these.
+ */
+
+/**
+ * @method getExistingBuckets
+ * @param {string} market
+ * @param {number} timeframe - ms
+ * @param {number} from - ms, inclusive
+ * @param {number} to - ms, exclusive
+ * @returns {Promise<number[]>}
+ */
+
+/**
+ * @method getBarCount
+ * @param {string} market
+ * @param {number} timeframe - ms
+ * @param {number} from - ms, inclusive
+ * @param {number} to - ms, exclusive
+ * @returns {Promise<number>}
+ */
+
+/**
+ * @method backfillUpsertBars
+ * @param {number} timeframe
+ * @param {string} market
+ * @param {Bar[]} bars
+ * @returns {Promise<{fromTsWritten: number|null, toTsWritten: number|null}>}
+ */
+
+/**
+ * @method backfillResampleRange
+ * @param {string} market
+ * @param {number} fromTs
+ * @param {number} toTs
+ * @returns {Promise<void>}
+ */
+```
+
+BackfillService selects the storage that has `format === 'point'` (same logic as the HTTP API in `server.js:402`):
+
+```js
+this.storage = storages.find(s => s.format === 'point')
+```
+
+### 5.3 Summary of All Changes
+
+#### New files
+
+| File | Description |
+|------|-------------|
+| `src/services/backfill.js` | BackfillService — main orchestrator, timer loop |
+| `src/services/backfill-detector.js` | GapDetector — progressive scan, gap identification |
+| `src/services/backfill-filler.js` | GapFiller — fetch trades, aggregate, write bars |
+
+#### Modified files
+
+| File | Changes |
+|------|---------|
+| `src/config.js` | Add `backfill`, `backfillStartTime`, `backfillTimeframes`, `backfillCheckInterval`, `backfillPairs`, `backfillMaxConcurrency`, `backfillRequestDelay` to defaults + validation logic |
+| `src/server.js` | After `initStorages()`: instantiate and start `BackfillService`. On SIGINT: call `backfillService.stop()` |
+| `src/storage/timescaledb.js` | Add `createBackfillPool()`, `getExistingBuckets()`, `getBarCount()`, `backfillUpsertBars()`, `backfillResampleRange()`. Refactor `upsertBars`/`resampleRangeToTimeframe` to extract pool-injectable internal helpers `_upsertBarsWithPool()`, `_resampleRangeWithPool()`. Store pool config in `this.poolConfig` for reuse. |
+| `src/storage/influx.js` | Add `getExistingBuckets()`, `backfillWritePoints()`, `backfillResample()` |
+| `src/exchange.js` | Add `fetchHistoricalTrades()` base method with `_fetchTradesPage()` dispatch |
+| `src/exchanges/binance.js` | Add `_fetchTradesPage()` (extracted from `getMissingTrades` fetch logic) |
+| `src/exchanges/binance_futures.js` | Add `_fetchTradesPage()` |
+| `src/exchanges/bybit.js` | Add `_fetchTradesPage()` |
+| `src/exchanges/coinbase.js` | Add `_fetchTradesPage()` |
+| `src/exchanges/bitfinex.js` | Add `_fetchTradesPage()` |
+| `src/exchanges/bitmex.js` | Add `_fetchTradesPage()` |
+| `src/exchanges/okex.js` | Add `_fetchTradesPage()` |
+| `src/exchanges/kraken.js` | Add `_fetchTradesPage()` |
+| `src/exchanges/huobi.js` | Add `_fetchTradesPage()` |
+| `src/exchanges/cryptocom.js` | Add `_fetchTradesPage()` |
+| `src/exchanges/bitmart.js` | Add `_fetchTradesPage()` |
+| `index.js` | Add `backfillService.stop()` to SIGINT handler |
 
 ## 6. Data Flow Diagram
 
@@ -402,7 +868,7 @@ Real-time Zone:
                                                                   resample (higher TFs)
 ```
 
-## 7. Edge Cases
+## 7. Edge Cases & Considerations
 
 ### 7.1 Exchange doesn't support `getMissingTrades`
 
