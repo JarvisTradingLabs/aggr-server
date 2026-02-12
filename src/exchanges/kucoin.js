@@ -186,6 +186,15 @@ class Kucoin extends Exchange {
   onApiRemoved(api) {
     this.stopKeepAlive(api)
   }
+
+  async fetchHistoricalTrades(_range) {
+    if (!this._warnedNoFetchHistoricalTrades) {
+      this._warnedNoFetchHistoricalTrades = true
+      console.warn(`[${this.id}] fetchHistoricalTrades is not implemented yet`)
+    }
+
+    return []
+  }
 }
 
 module.exports = Kucoin

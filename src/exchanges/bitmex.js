@@ -146,6 +146,43 @@ class Bitmex extends Exchange {
     }
   }
 
+  async fetchHistoricalTrades(range) {
+    const trades = []
+    let cursor = Number(range.from)
+    const end = Number(range.to)
+
+    while (cursor < end) {
+      const startTimeISO = new Date(cursor + 1).toISOString()
+      const endTimeISO = new Date(end).toISOString()
+      const endpoint = `https://www.bitmex.com/api/v1/trade?symbol=${range.pair}&startTime=${startTimeISO}&endTime=${endTimeISO}&count=1000`
+
+      const response = await axios.get(endpoint)
+      const batch = (response.data || [])
+        .map(trade => this.formatTrade(trade, range.pair))
+        .filter(trade => trade.timestamp > cursor && trade.timestamp < end)
+
+      if (!batch.length) {
+        break
+      }
+
+      trades.push(...batch)
+
+      const nextCursor = batch[batch.length - 1].timestamp
+      if (nextCursor <= cursor) {
+        break
+      }
+      cursor = nextCursor
+
+      if (!response.data || response.data.length < 1000) {
+        break
+      }
+
+      await this.waitBeforeContinueRecovery()
+    }
+
+    return trades
+  }
+
   getMissingTrades(range, totalRecovered = 0) {
     const startTimeISO = new Date(range.from + 1).toISOString()
     const endTimeISO = new Date(range.to).toISOString()

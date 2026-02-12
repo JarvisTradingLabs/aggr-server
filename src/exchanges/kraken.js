@@ -272,6 +272,73 @@ class Kraken extends Exchange {
         )
       })
   }
+
+  async fetchHistoricalTrades(range) {
+    const trades = []
+    const isFutures = typeof this.specs[range.pair] !== 'undefined'
+    const pair = range.pair.replace('/', '')
+    const state = {
+      from: Number(range.from),
+      to: Number(range.to)
+    }
+
+    while (state.from < state.to) {
+      let endpoint
+
+      if (isFutures) {
+        endpoint = `https://futures.kraken.com/derivatives/api/v3/history?symbol=${pair}&lastTime=${new Date(
+          state.to
+        ).toISOString()}`
+      } else {
+        endpoint = `https://api.kraken.com/0/public/Trades?pair=${pair}&since=${
+          state.from / 1000
+        }`
+      }
+
+      const response = await axios.get(endpoint)
+      const raw = isFutures
+        ? response?.data?.history || []
+        : Object.values(response?.data?.result || {})[0] || []
+
+      if (!raw.length) {
+        break
+      }
+
+      const batch = raw
+        .map(trade => this.formatTrade(trade, range.pair, isFutures))
+        .filter(
+          trade => trade.timestamp >= state.from + 1 && trade.timestamp < state.to
+        )
+
+      if (!batch.length) {
+        break
+      }
+
+      trades.push(...batch)
+
+      if (isFutures) {
+        const nextTo = batch[0].timestamp
+        if (nextTo >= state.to) {
+          break
+        }
+        state.to = nextTo
+      } else {
+        const nextFrom = batch[batch.length - 1].timestamp
+        if (nextFrom <= state.from) {
+          break
+        }
+        state.from = nextFrom
+      }
+
+      if (state.to - state.from <= 1000) {
+        break
+      }
+
+      await this.waitBeforeContinueRecovery()
+    }
+
+    return trades.sort((a, b) => a.timestamp - b.timestamp)
+  }
 }
 
 module.exports = Kraken

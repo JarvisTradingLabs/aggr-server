@@ -8,6 +8,7 @@ const Server = require('./src/server')
 const alertService = require('./src/services/alert')
 const { saveConnections } = require('./src/services/connections')
 const socketService = require('./src/services/socket')
+const BackfillService = require('./src/services/backfill')
 
 /* Load available exchanges
  */
@@ -38,14 +39,59 @@ for (let name of config.exchanges) {
  */
 
 const server = new Server(exchanges)
+let backfillService = null
+
+if (config.backfill) {
+  let backfillBootstrapFailed = false
+
+  const ensureBackfillStarted = () => {
+    if (backfillService || backfillBootstrapFailed || !server.storages) {
+      return
+    }
+
+    const service = new BackfillService({
+      exchanges: server.exchanges,
+      storages: server.storages
+    })
+
+    service
+      .start()
+      .then(() => {
+        backfillService = service
+      })
+      .catch(error => {
+        console.error('[backfill] failed to start from index process', error.message)
+        backfillBootstrapFailed = true
+      })
+  }
+
+  const backfillBootstrapInterval = setInterval(() => {
+    ensureBackfillStarted()
+
+    if (backfillService || backfillBootstrapFailed) {
+      clearInterval(backfillBootstrapInterval)
+    }
+  }, 250)
+
+  ensureBackfillStarted()
+}
 
 /* Backup server on SIGINT
  */
-process.on('SIGINT', async function () {
-  console.log('\nSIGINT')
+const onSignal = async signal => {
+  console.log('\n' + signal)
 
   if (!server.canExit()) {
     return
+  }
+
+  if (backfillService) {
+    try {
+      await backfillService.stop()
+      console.log('[exit] stopped backfill ✓')
+    } catch (error) {
+      console.error('[exit] failed to stop backfill', error.message)
+    }
   }
 
   if (config.collect) {
@@ -85,7 +131,10 @@ process.on('SIGINT', async function () {
   console.log('[init] goodbye')
 
   process.exit()
-})
+}
+
+process.on('SIGINT', () => onSignal('SIGINT'))
+process.on('SIGTERM', () => onSignal('SIGTERM'))
 
 if (process.env.pmx) {
   tx2.action('connect', function (markets, reply) {

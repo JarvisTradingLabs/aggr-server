@@ -661,6 +661,28 @@ class Exchange extends EventEmitter {
   }
 
   /**
+   * Fetch historical trades for backfill.
+   * Must be implemented per exchange.
+   *
+   * @param {{pair: string, from: number, to: number}} range
+   * @returns {Promise<Trade[]>}
+   */
+  async fetchHistoricalTrades(_range) {
+    throw new Error(`${this.id} must implement fetchHistoricalTrades(range)`)
+  }
+
+  /**
+   * Backfill slicing hint: expected max bars to cover per request.
+   * Exchange implementations should override with realistic limits.
+   *
+   * @param {{pair: string, timeframe: number}} _context
+   * @returns {number}
+   */
+  getBackfillRequestBarsLimit(_context) {
+    return 500
+  }
+
+  /**
    * Reconnect pairs
    * @param {string[]} pairs (local)
    * @returns {Promise<any>}

@@ -1,4 +1,5 @@
 const Exchange = require('../exchange')
+const axios = require('axios')
 const { sleep } = require('../helper')
 
 class BinanceUs extends Exchange {
@@ -89,6 +90,47 @@ class BinanceUs extends Exchange {
         }
       ])
     }
+  }
+
+  async fetchHistoricalTrades(_range) {
+    const range = _range
+    const trades = []
+    const end = Number(range.to)
+    let cursor = Number(range.from)
+
+    while (cursor < end) {
+      const requestEnd = Math.min(end, cursor + 1000 * 60 * 60)
+      const endpoint = `https://api.binance.us/api/v3/aggTrades?symbol=${range.pair.toUpperCase()}&startTime=${
+        cursor + 1
+      }&endTime=${requestEnd}&limit=1000`
+
+      const response = await axios.get(endpoint)
+      const payload = (response.data || [])
+        .filter(trade => trade.T > cursor && trade.T < end)
+        .map(trade => ({
+          exchange: this.id,
+          pair: range.pair,
+          timestamp: trade.T,
+          price: +trade.p,
+          size: +trade.q,
+          side: trade.m ? 'sell' : 'buy',
+          count: trade.l - trade.f + 1
+        }))
+
+      if (!payload.length) {
+        break
+      }
+
+      trades.push(...payload)
+
+      const nextCursor = payload[payload.length - 1].timestamp
+      if (nextCursor <= cursor) {
+        break
+      }
+      cursor = nextCursor
+    }
+
+    return trades
   }
 }
 

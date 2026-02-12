@@ -80,6 +80,15 @@ class Bitstamp extends Exchange {
       }
     ])
   }
+
+  async fetchHistoricalTrades(_range) {
+    if (!this._warnedNoFetchHistoricalTrades) {
+      this._warnedNoFetchHistoricalTrades = true
+      console.warn(`[${this.id}] fetchHistoricalTrades is not implemented yet`)
+    }
+
+    return []
+  }
 }
 
 module.exports = Bitstamp

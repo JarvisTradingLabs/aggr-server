@@ -70,8 +70,11 @@ class InfluxStorage {
         await this.influx.createDatabase(config.influxDatabase)
       }
 
-      if (config.collect) {
+      if (config.collect || config.backfill) {
         await this.ensureRetentionPolicies()
+      }
+
+      if (config.collect) {
 
         if (config.pairs.length) {
           await this.getPreviousBars()
@@ -1091,6 +1094,164 @@ class InfluxStorage {
     )*/
 
     return results
+  }
+
+  escapeInfluxLiteral(value) {
+    return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+  }
+
+  getMeasurementPath(timeframe) {
+    const timeframeLiteral = getHms(timeframe)
+    return {
+      rp: `${config.influxRetentionPrefix}${timeframeLiteral}`,
+      measurement: `${config.influxMeasurement}_${timeframeLiteral}`
+    }
+  }
+
+  async getExistingBuckets(market, timeframe, from, to) {
+    const { rp, measurement } = this.getMeasurementPath(timeframe)
+    const escapedMarket = this.escapeInfluxLiteral(market)
+
+    const query = `SELECT time FROM "${config.influxDatabase}"."${rp}"."${measurement}" WHERE time >= ${from}ms AND time < ${to}ms AND market = '${escapedMarket}'`
+    let results
+    try {
+      results = await this.influx.queryRaw(query, {
+        precision: 'ms',
+        epoch: 'ms'
+      })
+    } catch (_error) {
+      return []
+    }
+
+    const series = results?.results?.[0]?.series?.[0]
+
+    if (!series || !series.values || !series.values.length) {
+      return []
+    }
+
+    return series.values.map(value => Number(value[0]))
+  }
+
+  async getFirstByInterval(market, timeframe, from, to) {
+    const { rp, measurement } = this.getMeasurementPath(timeframe)
+    const escapedMarket = this.escapeInfluxLiteral(market)
+    const query = `SELECT time FROM "${config.influxDatabase}"."${rp}"."${measurement}" WHERE time >= ${from}ms AND time < ${to}ms AND market = '${escapedMarket}' ORDER BY time ASC LIMIT 1`
+
+    let results
+    try {
+      results = await this.influx.queryRaw(query, {
+        precision: 'ms',
+        epoch: 'ms'
+      })
+    } catch (_error) {
+      return null
+    }
+
+    const series = results?.results?.[0]?.series?.[0]
+    if (!series || !series.values || !series.values.length) {
+      return null
+    }
+
+    return Number(series.values[0][0])
+  }
+
+  async getLastByInterval(market, timeframe, from, to) {
+    const { rp, measurement } = this.getMeasurementPath(timeframe)
+    const escapedMarket = this.escapeInfluxLiteral(market)
+    const query = `SELECT time FROM "${config.influxDatabase}"."${rp}"."${measurement}" WHERE time >= ${from}ms AND time < ${to}ms AND market = '${escapedMarket}' ORDER BY time DESC LIMIT 1`
+
+    let results
+    try {
+      results = await this.influx.queryRaw(query, {
+        precision: 'ms',
+        epoch: 'ms'
+      })
+    } catch (_error) {
+      return null
+    }
+
+    const series = results?.results?.[0]?.series?.[0]
+    if (!series || !series.values || !series.values.length) {
+      return null
+    }
+
+    return Number(series.values[0][0])
+  }
+
+  async getBarCount(market, timeframe, from, to) {
+    const { rp, measurement } = this.getMeasurementPath(timeframe)
+    const escapedMarket = this.escapeInfluxLiteral(market)
+
+    const query = `SELECT COUNT(close) AS count FROM "${config.influxDatabase}"."${rp}"."${measurement}" WHERE time >= ${from}ms AND time < ${to}ms AND market = '${escapedMarket}'`
+
+    const results = await this.influx.queryRaw(query, {
+      precision: 'ms',
+      epoch: 'ms'
+    })
+
+    const series = results?.results?.[0]?.series?.[0]
+    if (!series || !series.values || !series.values.length) {
+      return 0
+    }
+
+    return Number(series.values[0][1] || 0)
+  }
+
+  async backfillUpsertBars(timeframe, market, bars) {
+    if (!bars || !bars.length) {
+      return {
+        fromTsWritten: null,
+        toTsWritten: null
+      }
+    }
+
+    const { rp, measurement } = this.getMeasurementPath(timeframe)
+    const points = bars.map(bar => ({
+      measurement,
+      tags: {
+        market
+      },
+      fields: {
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        vbuy: bar.vbuy,
+        vsell: bar.vsell,
+        cbuy: bar.cbuy,
+        csell: bar.csell,
+        lbuy: bar.lbuy,
+        lsell: bar.lsell,
+        count: bar.cbuy + bar.csell,
+        vol: bar.vbuy + bar.vsell
+      },
+      timestamp: bar.time
+    }))
+
+    await this.writePoints(points, {
+      precision: 'ms',
+      retentionPolicy: rp
+    })
+
+    return {
+      fromTsWritten: bars[0].time,
+      toTsWritten: bars[bars.length - 1].time
+    }
+  }
+
+  async backfillResampleRange(market, fromTs, toTs) {
+    if (toTs <= fromTs) {
+      return
+    }
+
+    await this.resample(
+      {
+        from: fromTs,
+        to: toTs,
+        markets: [market]
+      },
+      config.influxTimeframe
+    )
   }
 
   formatColumns(columns) {

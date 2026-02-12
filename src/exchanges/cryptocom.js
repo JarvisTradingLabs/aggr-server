@@ -108,6 +108,53 @@ class CryptoCom extends Exchange {
     }
   }
 
+  async fetchHistoricalTrades(range) {
+    const trades = []
+    const state = {
+      pair: range.pair,
+      from: Number(range.from),
+      to: Number(range.to)
+    }
+
+    while (true) {
+      const endpoint =
+        'https://api.crypto.com/exchange/v1/public/get-trades?' +
+        `instrument_name=${state.pair}&` +
+        'count=1000&' +
+        `start_ts=${state.from}&` +
+        `end_ts=${state.to}`
+
+      const response = await axios.get(endpoint)
+      const data = response?.data?.result?.data || []
+
+      if (!data.length) {
+        break
+      }
+
+      const batch = data
+        .map(t => this.formatResponse(t))
+        .filter(
+          trade => trade.timestamp >= state.from + 1 && trade.timestamp < state.to
+        )
+
+      if (!batch.length) {
+        break
+      }
+
+      trades.push(...batch)
+      state.to = batch[batch.length - 1].timestamp
+
+      const earliestTradeTime = Number(data[data.length - 1]?.t || 0)
+      if (state.to - state.from <= 1000 || earliestTradeTime < state.from) {
+        break
+      }
+
+      await this.waitBeforeContinueRecovery()
+    }
+
+    return trades.sort((a, b) => a.timestamp - b.timestamp)
+  }
+
   async getMissingTrades(range, totalRecovered = 0, _fromTradeId) {
     // https://exchange-docs.crypto.com/exchange/v1/rest-ws/index.html#public-get-trades
     // Retuns maximum 150 trades per request

@@ -70,6 +70,8 @@ class TimescaleDbStorage {
       application_name: config.timescaleApplicationName || 'aggr-server'
     }
 
+    this.poolConfig = poolConfig
+
     if (sslEnabled) {
       poolConfig.ssl = {
         rejectUnauthorized: !(
@@ -102,6 +104,36 @@ class TimescaleDbStorage {
     }
 
     console.log('[storage/timescaledb] connection ready')
+  }
+
+  async createBackfillPool() {
+    if (this.backfillPool) {
+      return this.backfillPool
+    }
+
+    const max = Math.max(
+      1,
+      Math.min(
+        Number(config.backfillMaxConcurrency || 1),
+        Number(config.timescalePoolMax || 20),
+        2
+      )
+    )
+
+    const poolConfig = {
+      ...(this.poolConfig || {}),
+      max,
+      application_name: `${config.timescaleApplicationName || 'aggr-server'}-backfill`
+    }
+
+    console.log(
+      `[storage/timescaledb] creating backfill pool (max=${poolConfig.max})`
+    )
+
+    this.backfillPool = new Pool(poolConfig)
+    await this.backfillPool.query('SELECT 1')
+
+    return this.backfillPool
   }
 
   async save(trades, isExiting) {
@@ -339,6 +371,10 @@ class TimescaleDbStorage {
   }
 
   async upsertBars(timeframe, market, bars) {
+    return this._upsertBarsWithPool(this.pool, timeframe, market, bars)
+  }
+
+  async _upsertBarsWithPool(pool, timeframe, market, bars) {
     if (!bars.length) {
       return {
         fromTsWritten: null,
@@ -425,7 +461,7 @@ class TimescaleDbStorage {
           lsell = EXCLUDED.lsell
       `
 
-      await this.pool.query(query, params)
+      await pool.query(query, params)
     }
 
     return {
@@ -435,6 +471,10 @@ class TimescaleDbStorage {
   }
 
   async resampleToHigherTimeframes(market, fromTs, toTs) {
+    return this._resampleToHigherTimeframesWithPool(this.pool, market, fromTs, toTs)
+  }
+
+  async _resampleToHigherTimeframesWithPool(pool, market, fromTs, toTs) {
     const higherTimeframes = this.timeframes.filter(tf => tf > this.baseTimeframe)
 
     if (!higherTimeframes.length) {
@@ -442,11 +482,33 @@ class TimescaleDbStorage {
     }
 
     for (const targetTimeframe of higherTimeframes) {
-      await this.resampleRangeToTimeframe(market, fromTs, toTs, targetTimeframe)
+      await this._resampleRangeToTimeframeWithPool(
+        pool,
+        market,
+        fromTs,
+        toTs,
+        targetTimeframe
+      )
     }
   }
 
   async resampleRangeToTimeframe(market, fromTs, toTs, targetTimeframe) {
+    return this._resampleRangeToTimeframeWithPool(
+      this.pool,
+      market,
+      fromTs,
+      toTs,
+      targetTimeframe
+    )
+  }
+
+  async _resampleRangeToTimeframeWithPool(
+    pool,
+    market,
+    fromTs,
+    toTs,
+    targetTimeframe
+  ) {
     const fromAligned = Math.floor(fromTs / targetTimeframe) * targetTimeframe
     const toAligned =
       Math.ceil((toTs + this.baseTimeframe) / targetTimeframe) * targetTimeframe
@@ -521,7 +583,7 @@ class TimescaleDbStorage {
         lsell = EXCLUDED.lsell
     `
 
-    await this.pool.query(query, [
+    await pool.query(query, [
       `${targetTimeframe} milliseconds`,
       targetTimeframe,
       this.baseTimeframe,
@@ -529,6 +591,86 @@ class TimescaleDbStorage {
       fromAligned,
       toAligned
     ])
+  }
+
+  async getExistingBuckets(market, timeframe, from, to) {
+    const query = `
+      SELECT EXTRACT(EPOCH FROM bucket)::bigint AS ts
+      FROM ${this.tablePath}
+      WHERE timeframe_ms = $1
+        AND market = $2
+        AND bucket >= to_timestamp($3 / 1000.0)
+        AND bucket < to_timestamp($4 / 1000.0)
+      ORDER BY bucket ASC
+    `
+
+    const result = await this.pool.query(query, [timeframe, market, from, to])
+
+    return result.rows.map(row => Number(row.ts) * 1000)
+  }
+
+  async getFirstByInterval(market, timeframe, from, to) {
+    const query = `
+      SELECT EXTRACT(EPOCH FROM bucket)::bigint AS ts
+      FROM ${this.tablePath}
+      WHERE timeframe_ms = $1
+        AND market = $2
+        AND bucket >= to_timestamp($3 / 1000.0)
+        AND bucket < to_timestamp($4 / 1000.0)
+      ORDER BY bucket ASC
+      LIMIT 1
+    `
+
+    const result = await this.pool.query(query, [timeframe, market, from, to])
+    if (!result.rows.length) {
+      return null
+    }
+
+    return Number(result.rows[0].ts) * 1000
+  }
+
+  async getLastByInterval(market, timeframe, from, to) {
+    const query = `
+      SELECT EXTRACT(EPOCH FROM bucket)::bigint AS ts
+      FROM ${this.tablePath}
+      WHERE timeframe_ms = $1
+        AND market = $2
+        AND bucket >= to_timestamp($3 / 1000.0)
+        AND bucket < to_timestamp($4 / 1000.0)
+      ORDER BY bucket DESC
+      LIMIT 1
+    `
+
+    const result = await this.pool.query(query, [timeframe, market, from, to])
+    if (!result.rows.length) {
+      return null
+    }
+
+    return Number(result.rows[0].ts) * 1000
+  }
+
+  async getBarCount(market, timeframe, from, to) {
+    const query = `
+      SELECT COUNT(*)::bigint AS count
+      FROM ${this.tablePath}
+      WHERE timeframe_ms = $1
+        AND market = $2
+        AND bucket >= to_timestamp($3 / 1000.0)
+        AND bucket < to_timestamp($4 / 1000.0)
+    `
+
+    const result = await this.pool.query(query, [timeframe, market, from, to])
+    return Number(result.rows[0]?.count || 0)
+  }
+
+  async backfillUpsertBars(timeframe, market, bars) {
+    const pool = await this.createBackfillPool()
+    return this._upsertBarsWithPool(pool, timeframe, market, bars)
+  }
+
+  async backfillResampleRange(market, fromTs, toTs) {
+    const pool = await this.createBackfillPool()
+    return this._resampleToHigherTimeframesWithPool(pool, market, fromTs, toTs)
   }
 
   fetch({ from, to, timeframe = 60000, markets = [] }) {

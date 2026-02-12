@@ -68,6 +68,10 @@ class Okex extends Exchange {
     }
   }
 
+  getBackfillRequestBarsLimit() {
+    return 100
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -332,6 +336,55 @@ class Okex extends Exchange {
       )
       return totalRecovered
     }
+  }
+
+  async fetchHistoricalTrades(range) {
+    const collected = []
+    const state = {
+      pair: range.pair,
+      from: Number(range.from),
+      to: Number(range.to)
+    }
+
+    if (this.types[state.pair] !== 'SPOT') {
+      try {
+        const liquidations = await this.fetchLiquidationOrders({ ...state })
+        if (liquidations.length) {
+          collected.push(
+            ...liquidations.map(liquidation =>
+              this.formatLiquidation(liquidation, state.pair)
+            )
+          )
+        }
+      } catch (error) {
+        console.error(
+          `[${this.id}] failed to get missing liquidations on ${state.pair}:`,
+          error.message
+        )
+      }
+    }
+
+    const endpoint = `https://www.okx.com/api/v5/market/history-trades?instId=${state.pair}&type=2&limit=100&after=${state.to}`
+
+    const response = await this.retryWithDelay(
+      () => axios.get(endpoint),
+      5,
+      1,
+      state
+    )
+
+    const data = response?.data?.data || []
+    const trades = data
+      .filter(
+        trade =>
+          Number(trade.ts) > state.from &&
+          Number(trade.ts) < state.to
+      )
+      .map(trade => this.formatTrade(trade))
+
+    collected.push(...trades)
+
+    return collected.sort((a, b) => a.timestamp - b.timestamp)
   }
 
   /**

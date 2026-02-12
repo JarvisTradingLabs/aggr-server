@@ -22,6 +22,10 @@ class Bitfinex extends Exchange {
     return pairs.map(product => product.toUpperCase())
   }
 
+  getBackfillRequestBarsLimit() {
+    return 1000
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -185,6 +189,20 @@ class Bitfinex extends Exchange {
       side: trade[5] > 1 ? 'sell' : 'buy',
       liquidation: true
     }
+  }
+
+  async fetchHistoricalTrades(range) {
+    const cursor = Number(range.from)
+    const end = Number(range.to)
+    const endpoint = `https://api-pub.bitfinex.com/v2/trades/Symbol/hist?symbol=${
+      't' + range.pair
+    }&start=${cursor + 1}&end=${end}&limit=1000&sort=1`
+
+    const response = await axios.get(endpoint)
+    return (response.data || [])
+      .map(trade => this.formatTrade(trade, range.pair))
+      .filter(trade => trade.timestamp > cursor && trade.timestamp < end)
+      .sort((a, b) => a.timestamp - b.timestamp)
   }
 
   getMissingTrades(range, totalRecovered = 0) {

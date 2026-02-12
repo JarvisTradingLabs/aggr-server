@@ -102,5 +102,14 @@ class Dydx extends Exchange {
       return true
     }
   }
+
+  async fetchHistoricalTrades(_range) {
+    if (!this._warnedNoFetchHistoricalTrades) {
+      this._warnedNoFetchHistoricalTrades = true
+      console.warn(`[${this.id}] fetchHistoricalTrades is not implemented yet`)
+    }
+
+    return []
+  }
 }
 module.exports = Dydx

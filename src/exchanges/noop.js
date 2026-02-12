@@ -10,6 +10,10 @@ class Noop extends Exchange {
   connect() {
     return false
   }
+
+  async fetchHistoricalTrades(_range) {
+    return []
+  }
 }
 
 module.exports = Noop

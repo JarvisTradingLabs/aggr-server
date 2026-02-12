@@ -307,6 +307,29 @@ class Huobi extends Exchange {
       })
   }
 
+  async fetchHistoricalTrades(range) {
+    let endpoint
+
+    if (this.types[range.pair] === 'futures') {
+      endpoint = `https://api.hbdm.com/market/history/trade?symbol=${range.pair}&size=2000`
+    } else if (this.types[range.pair] === 'swap') {
+      endpoint = `https://api.hbdm.com/swap-ex/market/history/trade?contract_code=${range.pair}&size=2000`
+    } else if (this.types[range.pair] === 'linear') {
+      endpoint = `https://api.hbdm.com/linear-swap-ex/market/history/trade?contract_code=${range.pair}&size=2000`
+    } else {
+      endpoint = `https://api.huobi.pro/market/history/trade?symbol=${range.pair}&size=2000`
+    }
+
+    const response = await axios.get(endpoint)
+    const data = response?.data?.data || []
+
+    return data
+      .reduce((acc, batch) => acc.concat(batch.data || []), [])
+      .map(trade => this.formatTrade(trade, range.pair))
+      .filter(trade => trade.timestamp >= range.from + 1 && trade.timestamp < range.to)
+      .sort((a, b) => a.timestamp - b.timestamp)
+  }
+
   subscribeLiquidations(api, pair, unsubscribe = false) {
     if (
       api._marketDataApi &&

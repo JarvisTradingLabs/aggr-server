@@ -262,6 +262,32 @@ class Bitmart extends Exchange {
       })
   }
 
+  async fetchHistoricalTrades(range) {
+    if (this.specs[range.pair]) {
+      return []
+    }
+
+    const endpoint =
+      this.endpoints.SPOT.RECENT_TRADES + `?symbol=${range.pair.toUpperCase()}`
+    const response = await axios.get(endpoint)
+
+    if (!response.data.data || !response.data.data.length) {
+      return []
+    }
+
+    return response.data.data
+      .map(trade => ({
+        exchange: this.id,
+        pair: trade[0],
+        timestamp: +trade[1],
+        price: +trade[2],
+        size: +trade[3],
+        side: trade[4]
+      }))
+      .filter(trade => trade.timestamp > range.from && trade.timestamp < range.to)
+      .sort((a, b) => a.timestamp - b.timestamp)
+  }
+
   onApiCreated(api) {
     if (api.url === WS_API_FUTURES) {
       this.startKeepAlive(api, { action: 'ping' }, 15000)

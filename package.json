@@ -4,6 +4,7 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
+    "backfill": "node backfill",
     "start": "pm2-runtime ecosystem.config.js",
     "dev": "pm2-dev ecosystem.config.dev.yaml",
     "generateVapidKeys": "node scripts/web-push/generateVapidKeys",

@@ -1,5 +1,6 @@
 const config = require('../config')
 const Exchange = require('../exchange')
+const axios = require('axios')
 
 class Deribit extends Exchange {
   constructor() {
@@ -38,6 +39,10 @@ class Deribit extends Exchange {
       products,
       types
     }
+  }
+
+  getBackfillRequestBarsLimit() {
+    return 1000
   }
 
   /**
@@ -144,6 +149,34 @@ class Deribit extends Exchange {
 
   onApiRemoved(api) {
     this.stopKeepAlive(api)
+  }
+
+  async fetchHistoricalTrades(range) {
+    const from = Number(range.from)
+    const to = Number(range.to)
+    const instrumentName = range.pair
+
+    if (!isFinite(from) || !isFinite(to) || from >= to) {
+      return []
+    }
+
+    const endpoint = `https://www.deribit.com/api/v2/public/get_last_trades_by_instrument_and_time?instrument_name=${encodeURIComponent(
+      instrumentName
+    )}&start_timestamp=${from + 1}&end_timestamp=${to}&count=1000&sorting=asc`
+
+    const response = await axios.get(endpoint)
+    const result = response?.data?.result || {}
+    const rawTrades = Array.isArray(result.trades) ? result.trades : []
+
+    return rawTrades
+      .map(trade => this.formatTrade(trade))
+      .filter(
+        trade =>
+          trade.pair === instrumentName &&
+          trade.timestamp > from &&
+          trade.timestamp < to
+      )
+      .sort((a, b) => a.timestamp - b.timestamp)
   }
 }
 

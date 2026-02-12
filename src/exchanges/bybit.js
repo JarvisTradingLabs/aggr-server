@@ -56,6 +56,14 @@ class Bybit extends Exchange {
       types
     }
   }
+
+  getBackfillRequestBarsLimit({ pair }) {
+    if (this.types && this.types[pair] === 'spot') {
+      return 60
+    }
+
+    return 1000
+  }
   /**
    * Sub
    * @param {WebSocket} api
@@ -228,6 +236,28 @@ class Bybit extends Exchange {
 
         return totalRecovered
       })
+  }
+
+  async fetchHistoricalTrades(range) {
+    const type = this.types[range.pair]
+    const isSpot = type === 'spot'
+    const limit = isSpot ? 60 : 1000
+    const realPair = isSpot ? range.pair.replace(SPOT_PAIR_REGEX, '') : range.pair
+    const endpoint = `${RECENT_TRADE_REST}?category=${this.types[range.pair]}&symbol=${realPair}&limit=${limit}`
+
+    const response = await axios.get(endpoint)
+    const list = response?.data?.result?.list || []
+
+    return list
+      .filter(trade => trade.time > range.from && trade.time <= range.to)
+      .map(trade => this.formatTrade({
+        T: trade.time,
+        s: trade.symbol,
+        p: trade.price,
+        v: trade.size,
+        S: trade.side,
+      }, isSpot))
+      .sort((a, b) => a.timestamp - b.timestamp)
   }
 
   onApiCreated(api) {

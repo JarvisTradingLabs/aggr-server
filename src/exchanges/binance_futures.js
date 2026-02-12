@@ -64,6 +64,10 @@ class BinanceFutures extends Exchange {
     }
   }
 
+  getBackfillRequestBarsLimit() {
+    return 1000
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -229,6 +233,27 @@ class BinanceFutures extends Exchange {
 
         return totalRecovered
       })
+  }
+
+  async fetchHistoricalTrades(range) {
+    const end = Number(range.to)
+    const start = Number(range.from)
+
+    let endpoint = `?symbol=${range.pair.toUpperCase()}&startTime=${start + 1}&endTime=${end}&limit=1000`
+    if (this.dapi && this.dapi[range.pair]) {
+      endpoint = 'https://dapi.binance.com/dapi/v1/aggTrades' + endpoint
+    } else {
+      endpoint = 'https://fapi.binance.com/fapi/v1/aggTrades' + endpoint
+    }
+
+    const response = await axios.get(endpoint)
+    return (response.data || [])
+      .filter(trade => trade.T > start && trade.T < end)
+      .map(trade => ({
+        ...this.formatTrade(trade, range.pair),
+        count: trade.l - trade.f + 1
+      }))
+      .sort((a, b) => a.timestamp - b.timestamp)
   }
 }
 

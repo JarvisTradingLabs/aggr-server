@@ -56,6 +56,10 @@ class Coinbase extends Exchange {
     }
   }
 
+  getBackfillRequestBarsLimit() {
+    return 100
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -157,6 +161,38 @@ class Coinbase extends Exchange {
       side: trade.side === 'buy' || trade.side === 'BUY' ? 'sell' : 'buy'
     }
   }
+
+  async fetchHistoricalTrades(range) {
+    const from = Number(range.from)
+    const to = Number(range.to)
+    const pair = range.pair
+    const isIntx = INTX_PAIR_REGEX.test(pair)
+
+    let endpoint
+    if (isIntx || !range.earliestTradeId) {
+      endpoint = `https://api.coinbase.com/api/v3/brokerage/market/products/${pair
+      }/ticker?limit=100&end=${Math.round(to / 1000)}&start=${Math.round(
+        from / 1000
+      )}`
+
+      if (Date.now() - to < 10000) {
+        await sleep(10000)
+      }
+    } else {
+      endpoint = `https://api.exchange.coinbase.com/products/${pair}/trades?limit=1000&after=${range.earliestTradeId}`
+    }
+
+    const response = await axios.get(endpoint)
+    const rawData = Array.isArray(response.data)
+      ? response.data
+      : response.data.trades || []
+
+    return rawData
+      .map(trade => this.formatTrade(trade, pair))
+      .filter(a => a.timestamp >= from + 1 && a.timestamp < to)
+      .sort((a, b) => a.timestamp - b.timestamp)
+  }
+
   async getMissingTrades(range, totalRecovered = 0) {
     const isIntx = INTX_PAIR_REGEX.test(range.pair)
     let endpoint

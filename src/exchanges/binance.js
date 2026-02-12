@@ -22,6 +22,10 @@ class Binance extends Exchange {
     return data.symbols.map(a => a.symbol.toLowerCase())
   }
 
+  getBackfillRequestBarsLimit() {
+    return 1000
+  }
+
   /**
    * Sub
    * @param {WebSocket} api
@@ -146,6 +150,24 @@ class Binance extends Exchange {
           err.message
         )
       })
+  }
+
+  async fetchHistoricalTrades(range) {
+    const end = Number(range.to)
+    const start = Number(range.from)
+    const endpoint = `https://data-api.binance.vision/api/v3/aggTrades?symbol=${range.pair.toUpperCase()}&startTime=${
+      start + 1
+    }&endTime=${end}&limit=1000`
+
+    const response = await axios.get(endpoint)
+    return (response.data || [])
+      .filter(trade => trade.T > start && trade.T < end)
+      .map(trade => ({
+        ...this.formatTrade(trade, range.pair),
+        count: trade.l - trade.f + 1,
+        timestamp: trade.T
+      }))
+      .sort((a, b) => a.timestamp - b.timestamp)
   }
 }
 

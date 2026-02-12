@@ -135,11 +135,41 @@ const defaultConfig = {
     1000 * 60 * 60 * 2,
     1000 * 60 * 60 * 4,
     1000 * 60 * 60 * 6,
+    1000 * 60 * 60 * 12,
     1000 * 60 * 60 * 24
   ],
 
   // trigger resample every minute
   influxResampleInterval: 60000,
+
+  // enable backfill service
+  backfill: false,
+
+  // historical completeness lower bound (ISO string or ms timestamp)
+  backfillStartTime: null,
+
+  // timeframes to scan/fill (ms)
+  backfillTimeframes: [
+    60000,
+    300000,
+    900000,
+    3600000,
+    14400000,
+    43200000,
+    86400000
+  ],
+
+  // scan tick interval
+  backfillCheckInterval: 60000,
+
+  // defaults to config.pairs if empty
+  backfillPairs: [],
+
+  // global fill concurrency
+  backfillMaxConcurrency: 1,
+
+  // delay between backfill REST requests
+  backfillRequestDelay: 500,
 
   // number of bars to retain within influx db per timeframe
   influxRetentionPerTimeframe: 5000,
@@ -374,6 +404,114 @@ if (!Array.isArray(config.pairs)) {
       .filter(a => a.length)
   } else {
     config.pairs = []
+  }
+}
+
+if (!Array.isArray(config.backfillPairs)) {
+  if (typeof config.backfillPairs === 'string' && config.backfillPairs.trim()) {
+    config.backfillPairs = config.backfillPairs
+      .split(',')
+      .map(a => a.trim())
+      .filter(a => a.length)
+  } else {
+    config.backfillPairs = []
+  }
+}
+
+if (!Array.isArray(config.backfillTimeframes)) {
+  if (
+    typeof config.backfillTimeframes === 'string' &&
+    config.backfillTimeframes.trim().length
+  ) {
+    config.backfillTimeframes = config.backfillTimeframes
+      .split(',')
+      .map(a => Number(a.trim()))
+      .filter(a => !isNaN(a))
+  } else {
+    config.backfillTimeframes = []
+  }
+}
+
+config.backfillCheckInterval = Number(config.backfillCheckInterval || 60000)
+config.backfillMaxConcurrency = Number(config.backfillMaxConcurrency || 1)
+config.backfillRequestDelay = Number(config.backfillRequestDelay || 0)
+
+if (!isFinite(config.backfillCheckInterval) || config.backfillCheckInterval <= 0) {
+  throw new Error('backfillCheckInterval must be a positive number')
+}
+
+if (!isFinite(config.backfillMaxConcurrency) || config.backfillMaxConcurrency <= 0) {
+  throw new Error('backfillMaxConcurrency must be a positive number')
+}
+
+if (!isFinite(config.backfillRequestDelay) || config.backfillRequestDelay < 0) {
+  throw new Error('backfillRequestDelay must be >= 0')
+}
+
+const allowedBackfillTimeframes = [
+  60000,
+  300000,
+  900000,
+  3600000,
+  14400000,
+  43200000,
+  86400000
+]
+
+for (const timeframe of config.backfillTimeframes) {
+  if (allowedBackfillTimeframes.indexOf(timeframe) === -1) {
+    throw new Error(
+      `Invalid backfill timeframe ${timeframe}, allowed values: ${allowedBackfillTimeframes.join(
+        ', '
+      )}`
+    )
+  }
+}
+
+if (config.backfillStartTime !== null && typeof config.backfillStartTime !== 'undefined') {
+  const parsedBackfillStartTime = Number(config.backfillStartTime)
+  let timestamp = parsedBackfillStartTime
+
+  if (isNaN(parsedBackfillStartTime)) {
+    timestamp = +new Date(config.backfillStartTime)
+  }
+
+  if (!isFinite(timestamp)) {
+    throw new Error('Invalid backfillStartTime')
+  }
+
+  config.backfillStartTime = timestamp
+}
+
+if (config.backfill) {
+  if (!config.backfillTimeframes.length) {
+    throw new Error('backfillTimeframes must not be empty when backfill=true')
+  }
+
+  const supportedStorageTimeframes = [Number(config.influxTimeframe)].concat(
+    (config.influxResampleTo || []).map(Number)
+  )
+
+  for (const timeframe of config.backfillTimeframes) {
+    if (supportedStorageTimeframes.indexOf(Number(timeframe)) === -1) {
+      throw new Error(
+        `backfill timeframe ${timeframe} is not present in supported storage timeframes (${supportedStorageTimeframes.join(
+          ', '
+        )})`
+      )
+    }
+  }
+
+  if (
+    config.backfillStartTime === null ||
+    typeof config.backfillStartTime === 'undefined'
+  ) {
+    // defaults to 1 year ago
+    config.backfillStartTime = Date.now() - 1000 * 60 * 60 * 24 * 365
+  }
+
+  if (config.backfillStartTime >= Date.now()) {
+    throw new Error('backfillStartTime must be in the past')
   }
 }
 
