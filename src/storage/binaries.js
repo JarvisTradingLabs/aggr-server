@@ -1342,7 +1342,7 @@ class BinariesStorage {
 
     // Inject pending bars for near-realtime data
     if (needsPendingBars) {
-      const pendingBars = this.getPendingBars(markets, from, to)
+      const pendingBars = this.getPendingBars(markets, from, to, timeframe)
       for (let i = 0; i < pendingBars.length; i++) {
         const bar = pendingBars[i]
         // Time is converted to seconds to match InfluxDB format (precision: 's')
@@ -1387,7 +1387,57 @@ class BinariesStorage {
    * @param {number} to - End timestamp (exclusive)
    * @returns {Object[]} Array of pending bar objects with market field
    */
-  getPendingBars(markets, from, to) {
+  aggregateBarsToTimeframe(bars, timeframe, from, to) {
+    if (!timeframe || timeframe <= this.baseTimeframe) {
+      return bars.filter(bar => bar.time >= from && bar.time < to)
+    }
+
+    const grouped = {}
+
+    for (let i = 0; i < bars.length; i++) {
+      const source = bars[i]
+      const bucket = Math.floor(source.time / timeframe) * timeframe
+
+      if (bucket < from || bucket >= to) {
+        continue
+      }
+
+      const key = source.market + ':' + bucket
+      const existing = grouped[key]
+
+      if (!existing) {
+        grouped[key] = {
+          time: bucket,
+          market: source.market,
+          open: source.open,
+          high: source.high,
+          low: source.low,
+          close: source.close,
+          vbuy: source.vbuy,
+          vsell: source.vsell,
+          cbuy: source.cbuy,
+          csell: source.csell,
+          lbuy: source.lbuy,
+          lsell: source.lsell
+        }
+        continue
+      }
+
+      existing.high = Math.max(existing.high, source.high)
+      existing.low = Math.min(existing.low, source.low)
+      existing.close = source.close
+      existing.vbuy += source.vbuy
+      existing.vsell += source.vsell
+      existing.cbuy += source.cbuy
+      existing.csell += source.csell
+      existing.lbuy += source.lbuy
+      existing.lsell += source.lsell
+    }
+
+    return Object.values(grouped)
+  }
+
+  getPendingBars(markets, from, to, timeframe = this.baseTimeframe) {
     const results = []
 
     for (const market of markets) {
@@ -1409,7 +1459,7 @@ class BinariesStorage {
       }
     }
 
-    return results
+    return this.aggregateBarsToTimeframe(results, timeframe, from, to)
   }
 }
 

@@ -601,7 +601,7 @@ class TimescaleDbStorage {
         }
 
         if (to > Date.now() - config.influxResampleInterval) {
-          const pendingBars = this.getPendingBars(markets, from, to)
+          const pendingBars = this.getPendingBars(markets, from, to, timeframe)
           output.results = output.results.concat(pendingBars).sort((a, b) => a[0] - b[0])
         }
 
@@ -617,8 +617,58 @@ class TimescaleDbStorage {
       })
   }
 
-  getPendingBars(markets, from, to) {
-    const results = []
+  aggregateBarsToTimeframe(bars, timeframe, from, to) {
+    if (!timeframe || timeframe <= this.baseTimeframe) {
+      return bars.filter(bar => bar.time >= from && bar.time < to)
+    }
+
+    const grouped = {}
+
+    for (let i = 0; i < bars.length; i++) {
+      const source = bars[i]
+      const bucket = Math.floor(source.time / timeframe) * timeframe
+
+      if (bucket < from || bucket >= to) {
+        continue
+      }
+
+      const key = source.market + ':' + bucket
+      const existing = grouped[key]
+
+      if (!existing) {
+        grouped[key] = {
+          time: bucket,
+          market: source.market,
+          open: source.open,
+          high: source.high,
+          low: source.low,
+          close: source.close,
+          vbuy: source.vbuy,
+          vsell: source.vsell,
+          cbuy: source.cbuy,
+          csell: source.csell,
+          lbuy: source.lbuy,
+          lsell: source.lsell
+        }
+        continue
+      }
+
+      existing.high = Math.max(existing.high, source.high)
+      existing.low = Math.min(existing.low, source.low)
+      existing.close = source.close
+      existing.vbuy += source.vbuy
+      existing.vsell += source.vsell
+      existing.cbuy += source.cbuy
+      existing.csell += source.csell
+      existing.lbuy += source.lbuy
+      existing.lsell += source.lsell
+    }
+
+    return Object.values(grouped)
+  }
+
+  getPendingBars(markets, from, to, timeframe = this.baseTimeframe) {
+    const rows = []
 
     const selectedMarkets = markets.length
       ? markets
@@ -644,24 +694,37 @@ class TimescaleDbStorage {
           continue
         }
 
-        results.push([
-          Math.floor(barTime / 1000),
+        rows.push({
+          time: barTime,
           market,
-          bar.open,
-          bar.high,
-          bar.low,
-          bar.close,
-          bar.vbuy,
-          bar.vsell,
-          bar.cbuy,
-          bar.csell,
-          bar.lbuy,
-          bar.lsell
-        ])
+          open: bar.open,
+          high: bar.high,
+          low: bar.low,
+          close: bar.close,
+          vbuy: bar.vbuy,
+          vsell: bar.vsell,
+          cbuy: bar.cbuy,
+          csell: bar.csell,
+          lbuy: bar.lbuy,
+          lsell: bar.lsell
+        })
       }
     }
 
-    return results
+    return this.aggregateBarsToTimeframe(rows, timeframe, from, to).map(bar => [
+      Math.floor(bar.time / 1000),
+      bar.market,
+      bar.open,
+      bar.high,
+      bar.low,
+      bar.close,
+      bar.vbuy,
+      bar.vsell,
+      bar.cbuy,
+      bar.csell,
+      bar.lbuy,
+      bar.lsell
+    ])
   }
 }
 

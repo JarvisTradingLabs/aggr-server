@@ -144,7 +144,12 @@ class InfluxStorage {
         // this is a request for pending bars from cluster
         const payload = {
           pendingBarsRequestId: data.pendingBarsRequestId,
-          results: this.getPendingBars(data.markets, data.from, data.to)
+          results: this.getPendingBars(
+            data.markets,
+            data.from,
+            data.to,
+            data.timeframe
+          )
         }
         socketService.clusterSocket.write(
           JSON.stringify({
@@ -940,9 +945,12 @@ class InfluxStorage {
       )
     } else {
       // use current node pending bars
-      const injectedPendingBars = this.getPendingBars(markets, from, to).sort(
-        (a, b) => a.time - b.time
-      )
+      const injectedPendingBars = this.getPendingBars(
+        markets,
+        from,
+        to,
+        timeframe
+      ).sort((a, b) => a.time - b.time)
 
       return Promise.resolve(bars.concat(injectedPendingBars))
     }
@@ -1006,7 +1014,7 @@ class InfluxStorage {
         throw new Error(`${getHms(timeframe)} timeframe isn't supported`)
       }
       promisesOfBars.push(
-        this.requestCollectorPendingBars(collector, markets, from, to)
+        this.requestCollectorPendingBars(collector, markets, from, to, timeframe)
       )
     }
 
@@ -1023,7 +1031,7 @@ class InfluxStorage {
    * @param {number} from
    * @param {number} to
    */
-  async requestCollectorPendingBars(collector, markets, from, to) {
+  async requestCollectorPendingBars(collector, markets, from, to, timeframe) {
     return new Promise(resolve => {
       const pendingBarsRequestId = ID()
 
@@ -1060,14 +1068,65 @@ class InfluxStorage {
             pendingBarsRequestId,
             markets,
             from,
-            to
+            to,
+            timeframe
           }
         }) + '#'
       )
     })
   }
 
-  getPendingBars(markets, from, to) {
+  aggregateBarsToTimeframe(bars, timeframe, from, to) {
+    if (!timeframe || timeframe <= config.influxTimeframe) {
+      return bars.filter(bar => bar.time >= from && bar.time < to)
+    }
+
+    const grouped = {}
+
+    for (let i = 0; i < bars.length; i++) {
+      const source = bars[i]
+      const bucket = Math.floor(source.time / timeframe) * timeframe
+
+      if (bucket < from || bucket >= to) {
+        continue
+      }
+
+      const key = source.market + ':' + bucket
+      const existing = grouped[key]
+
+      if (!existing) {
+        grouped[key] = {
+          time: bucket,
+          market: source.market,
+          open: source.open,
+          high: source.high,
+          low: source.low,
+          close: source.close,
+          vbuy: source.vbuy,
+          vsell: source.vsell,
+          cbuy: source.cbuy,
+          csell: source.csell,
+          lbuy: source.lbuy,
+          lsell: source.lsell
+        }
+        continue
+      }
+
+      existing.high = Math.max(existing.high, source.high)
+      existing.low = Math.min(existing.low, source.low)
+      existing.close = source.close
+      existing.vbuy += source.vbuy
+      existing.vsell += source.vsell
+      existing.cbuy += source.cbuy
+      existing.csell += source.csell
+      existing.lbuy += source.lbuy
+      existing.lsell += source.lsell
+    }
+
+    return Object.values(grouped)
+  }
+
+  getPendingBars(markets, from, to, timeframe = config.influxTimeframe) {
     const results = []
 
     for (const market of markets) {
@@ -1090,7 +1149,7 @@ class InfluxStorage {
       ).toISOString()} and ${new Date(+to).toISOString()}`
     )*/
 
-    return results
+    return this.aggregateBarsToTimeframe(results, timeframe, from, to)
   }
 
   formatColumns(columns) {
